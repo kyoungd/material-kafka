@@ -16,7 +16,7 @@ async function run() {
             "fromBeginning": false
         });
         await consumer.run({
-            "eachMessage": async result => {
+            "eachMessage": async ({ topic, partition, message }) => {
                 console.log(result.topic);
                 console.log(result.message.key.toString());
                 console.log(result.message.value.toString());

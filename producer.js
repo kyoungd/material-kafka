@@ -12,7 +12,7 @@ async function run() {
         await producer.connect();
         console.log("Connected.");
         const msg = {
-            type: "TWEET_START_FOLLOW",
+            type: "TWEETS_GET",
             symbol: "MSFT",
             message: "finally embracing open source.  heading in the right direction.",
             start_date: "2021-05-21 00:00:00"
@@ -21,7 +21,7 @@ async function run() {
         const result = await producer.send({
             "topic": "TWEET",
             "messages": [{
-                "key": "TWEET_START_FOLLOW",
+                "key": "TWEETS_GET",
                 "value": jsonMessage,
                 "partition": 0
             }]
