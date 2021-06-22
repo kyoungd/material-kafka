@@ -13,12 +13,27 @@ const pool = new Pool({
     port: process.env.DB_PORT || "5432"
 });
 
-async function get_tweets(messages) {
-    const url = "http://localhost:8001/twint"
-    const postPromises = messages.map(async message => {
-        const result = await post(url, message.data);
-        await postKafkaCommand(result.message);
-    });
+const kafka = new Kafka({
+    "clientId": "kafka_connect",
+    "brokers": ["localhost:9092"]
+});
+
+async function get_tweets(message) {
+    try {
+        const url = process.env.TWEET_URL || "http://localhost:8101/tweets";
+        const data = {
+            "messages": [
+                {
+                    "key": "TWEETS_GET",
+                    "value": message,
+                }
+            ]
+        }
+        const result = await post(url, JSON.stringify(data));
+    }
+    catch (ex) {
+        console.log(ex);
+    }
 }
 
 async function save_tweets(message) {
@@ -38,54 +53,89 @@ async function save_tweets(message) {
                 message.user_id,
                 message.username,
                 message.symbol,
-                message.tweet_json
+                message.tweet_json,
+                message.tweet_dt,
             ];
             let insertQuery = 'INSERT INTO tweets '
-                + ' (tweet_text, author_id, tweet_id, retweet_count, reply_count, like_count, quote_count, user_id, user_name, symbol, tweet_json) '
-                + ' VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT DO NOTHING returning id';
+                + ' (tweet_text, author_id, tweet_id, retweet_count, reply_count, like_count, quote_count, user_id, user_name, symbol, tweet_json, tweet_dt) '
+                + ' VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT DO NOTHING returning id';
             const query2 = {
                 text: insertQuery,
                 values
             }
             const result2 = await pool.query(query2);
             const insertId = result2.rows[0].id;
-            const jsonMessage = JSON.stringify({ id: insertId, tweet_text: message.tweet_text });
-            const messages = {
-                "topic": "TWEET",
-                "messages": [{
-                    "key": "TWEETS_GET_SENTIMENT",
-                    "value": jsonMessage,
-                    "partition": 0
-                }]
-            }
-            postKafkaCommand(messages);
+            return insertId;
             console.log('INSERT pool.query():', result2);
         }
+        else
+            return 0;
+    }
+    catch (ex) {
+        console.log(ex);
+        return 0;
+    }
+}
+
+async function add_get_sentiment_message(id, tweet_text) {
+    try {
+        const jsonMessage = JSON.stringify({ id, tweet_text });
+        const messages = {
+            "topic": "TWEET",
+            "messages": [{
+                "key": "TWEETS_SENTIMENT",
+                "value": jsonMessage,
+                "partition": 0
+            }]
+        }
+        await postKafkaCommand(kafka, messages);
     }
     catch (ex) {
         console.log(ex);
     }
 }
 
-async function get_sentiment(messages) {
-    const message = messages[0];
-    const url = "http://localhost:8002/sentiment"
-    const result = await post(url, message);
-    await postKafkaCommand(result.message);
+async function get_sentiment(text) {
+    try {
+        const url = process.env.SENTIMENT_URL || "http://localhost:8102/sentiment";
+        const bodyData = JSON.stringify({ text });
+        const result = await post(url, bodyData);
+
+        let score_total = 0;
+        let score_count = 0;
+        result.data.forEach(score => {
+            score_total += score.sentiment_score;
+            ++score_count;
+        })
+        const sentiment_score = score_count != 0 ? score_total / score_count : 0;
+        return sentiment_score;
+    }
+    catch (ex) {
+        console.log(ex);
+    }
+    return 0;
 }
 
-async function save_sentiment(messages) {
-    const message = messages[0]
-    const queryUpdate = "UPDATE tweets SET sentiment_score=$2, sentiment_rated=true WHERE id=%1";
-    const values = [message.id, message.score];
-    pool.query(queryUpdate, values, (err, res) => {
-        if (err) {
-            console.log('UPDATE pool.query():', err);
-        }
-        if (res) {
-            console.log('UPDATE pool.query():', res);
-        }
-    });
+
+async function save_sentiment_score(queryUpdate, id, sentiment_score) {
+    try {
+        const values = [id, sentiment_score];
+        const res = await pool.query({ text: queryUpdate, values });
+        console.log('UPDATE pool.query():', res);
+    }
+    catch (ex) {
+        console.log(ex);
+    }
+}
+
+async function save_sentiment(id, sentiment_score) {
+    const queryUpdate = "UPDATE tweets SET sentiment_score=$2, sentiment_rated=true WHERE id=$1";
+    return await save_sentiment_score(queryUpdate, id, sentiment_score);
+}
+
+async function save_yahoo_news(id, sentiment_score) {
+    const queryUpdate = "UPDATE site_yahoos SET sentiment=$2 WHERE id=$1";
+    return await save_sentiment_score(queryUpdate, id, sentiment_score);
 }
 
 async function processKafkaTweet(key, data) {
@@ -94,13 +144,18 @@ async function processKafkaTweet(key, data) {
             await get_tweets(data);
             break;
         case "TWEETS_SAVE":
-            await save_tweets(data);
+            const insertId = await save_tweets(data);
+            if (insertId > 0)
+                add_get_sentiment_message(insertId, data.tweet_text);
             break;
-        case "TWEETS_GET_SENTIMENT":
-            await get_sentiment(data);
+        case "TWEETS_SENTIMENT":
+            const sentiment_score = await get_sentiment(data.tweet_text);
+            await save_sentiment(data.id, sentiment_score);
             break;
-        case "TWEETS_SAVE_SENTIMENT":
-            await save_sentiment(data);
+        case "YAHOO_NEWS":
+            const news1 = data.title[0] + "." + data.description[0];
+            const sentiment2 = await get_sentiment(news1);
+            await save_yahoo_news(data.id, sentiment2);
             break;
         default:
             break;
@@ -109,10 +164,6 @@ async function processKafkaTweet(key, data) {
 
 async function run() {
     try {
-        const kafka = new Kafka({
-            "clientId": "kafka_connect",
-            "brokers": ["localhost:9092"]
-        });
         const consumer = kafka.consumer({ "groupId": "test" });
         console.log("Connecting... ");
         await consumer.connect();
